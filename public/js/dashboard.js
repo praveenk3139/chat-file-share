@@ -334,6 +334,12 @@ async function loadUsers() {
     });
     userListEl.appendChild(el);
   });
+
+  // Auto-select first contact if none is currently selected
+  if (!activeUser && data.users.length > 0) {
+    const firstUser = typeof data.users[0] === 'string' ? data.users[0] : data.users[0].username;
+    selectUser(firstUser);
+  }
 }
 
 async function selectUser(username) {
