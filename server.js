@@ -233,14 +233,19 @@ app.get('/api/me', requireAuth, async (req, res) => {
 });
 
 app.get('/api/users', requireAuth, async (req, res) => {
-  const users = await db.getAllUsersList();
-  const list = users
-    .filter(u => u.username !== req.session.username && !u.isBlocked)
-    .map(u => ({
-      username: u.username,
-      avatarUrl: getUserAvatarUrl(u, u.username)
-    }));
-  res.json({ users: list });
+  try {
+    const users = await db.getAllUsersList();
+    const list = users
+      .filter(u => u.username !== req.session.username && !u.isBlocked)
+      .map(u => ({
+        username: u.username,
+        avatarUrl: getUserAvatarUrl(u, u.username)
+      }));
+    res.json({ users: list });
+  } catch (err) {
+    console.error('Error fetching users:', err);
+    res.status(500).json({ error: 'Failed to fetch user list' });
+  }
 });
 
 // ---------- AVATAR ROUTES (ANYTIME CHANGE) ----------

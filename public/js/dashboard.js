@@ -305,12 +305,21 @@ function insertEmoji(emoji) {
 // ---------- USER LIST & CHAT ----------
 
 async function loadUsers() {
-  const res = await fetch('/api/users');
-  const data = await res.json();
-  if (!data.users || !data.users.length) {
-    userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px;">No other active users yet.<br>Invite someone to sign up!</div>';
-    return;
-  }
+  try {
+    const res = await fetch('/api/users');
+    if (res.status === 401) {
+      window.location.href = '/login.html';
+      return;
+    }
+    const data = await res.json();
+    if (data.error) {
+      userListEl.innerHTML = `<div class="empty-state" style="margin-top:20px; color:#fca5a5;">${escapeHtml(data.error)}</div>`;
+      return;
+    }
+    if (!data.users || !data.users.length) {
+      userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px;">No other active users yet.<br><small style="opacity:0.75;display:block;margin-top:6px;">Sign up another account in incognito to start chatting!</small></div>';
+      return;
+    }
   userListEl.innerHTML = '';
   data.users.forEach(item => {
     const u = typeof item === 'string' ? item : item.username;
@@ -339,6 +348,10 @@ async function loadUsers() {
   if (!activeUser && data.users.length > 0) {
     const firstUser = typeof data.users[0] === 'string' ? data.users[0] : data.users[0].username;
     selectUser(firstUser);
+  }
+  } catch (err) {
+    console.error('Failed to load users:', err);
+    userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px; color:#fca5a5;">Failed to load users. Please refresh.</div>';
   }
 }
 
