@@ -84,10 +84,11 @@ if (!cached) {
 let isMongoReady = false;
 
 async function connectDB() {
-  if (!MONGODB_URI) {
+  const uri = process.env.MONGODB_URI || MONGODB_URI;
+  if (!uri) {
     return false;
   }
-  if (cached.conn) {
+  if (cached.conn && mongoose.connection.readyState === 1) {
     isMongoReady = true;
     return true;
   }
@@ -96,7 +97,7 @@ async function connectDB() {
       bufferCommands: false,
       serverSelectionTimeoutMS: 5000,
     };
-    cached.promise = mongoose.connect(MONGODB_URI, opts).then((m) => {
+    cached.promise = mongoose.connect(uri, opts).then((m) => {
       console.log('Connected to MongoDB Atlas successfully.');
       isMongoReady = true;
       return m;
@@ -168,7 +169,7 @@ async function saveUser(username, data) {
     const doc = await UserModel.findOneAndUpdate(
       { username },
       { $set: { username, ...data } },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' }
     ).lean();
     return doc;
   }
