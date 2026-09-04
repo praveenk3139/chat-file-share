@@ -39,6 +39,7 @@ Optional environment variables:
 |------------------|-----------------------------------|-----------------------------------|
 | `PORT`           | `3000`                            | Port the server listens on       |
 | `SESSION_SECRET` | (a default, **change for prod**)  | Secret used to sign session cookies |
+| `MONGODB_URI`    | *(optional)*                      | MongoDB Atlas connection string (enables permanent cloud storage on Vercel) |
 
 ## How the pieces work
 
@@ -74,9 +75,10 @@ The project includes `vercel.json`, `api/index.js`, and automatic serverless sto
 2. Go to [vercel.com/new](https://vercel.com/new) and import your repository.
 3. In **Environment Variables**, add:
    - `SESSION_SECRET`: Any random secure string (e.g. `openssl rand -hex 32`).
+   - `MONGODB_URI`: *(Recommended)* Your free MongoDB Atlas connection string (e.g. `mongodb+srv://<user>:<password>@cluster0.mongodb.net/chatshare?retryWrites=true&w=majority`).
 4. Click **Deploy**.
 
-> **Note on Vercel Serverless**: Vercel functions use an ephemeral `/tmp` filesystem and serverless lambdas. ChatShare has been configured with HTTP fallback and background synchronization to work smoothly on Vercel without persistent WebSocket servers. If you need permanent file uploads and permanent message retention across serverless container re-provisions, you can connect MongoDB/PostgreSQL or deploy to a persistent host like Render/Railway.
+> **Permanent User Storage on Vercel**: By adding `MONGODB_URI`, all user accounts, passwords, messages, and file metadata are saved permanently to MongoDB Atlas so they will never be lost when Vercel serverless containers restart.
 
 ### Example: Render.com (For persistent WebSocket & disk)
 1. Push this project to a GitHub repo.

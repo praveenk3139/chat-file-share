@@ -4,8 +4,9 @@
  * - Admin account: praveen / 3139 with full management rights
  * - Block & delete users, monitor all conversations & files
  * - User avatars: custom photo upload anytime + instant real-time sync
- * - Private 1:1 chat between users (Socket.IO, persisted to data/messages.json)
- * - File sharing by username (stored in /uploads, a shared folder, metadata in data/files.json)
+ * - Private 1:1 chat between users (Socket.IO + HTTP fallback)
+ * - File sharing by username (stored in uploads/, metadata persisted in database)
+ * - Persistent Cloud DB (MongoDB Atlas) support + local JSON fallback via db.js
  */
 
 const path = require('path');
@@ -17,6 +18,7 @@ const multer = require('multer');
 const { nanoid } = require('nanoid');
 const http = require('http');
 const { Server } = require('socket.io');
+const db = require('./db');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change-this-secret-in-production';
@@ -26,66 +28,20 @@ const ADMIN_PASSWORD = '3139';
 
 const IS_VERCEL = !!process.env.VERCEL;
 
-const DATA_DIR = IS_VERCEL ? path.join('/tmp', 'chat-data') : path.join(__dirname, 'data');
 const UPLOAD_DIR = IS_VERCEL ? path.join('/tmp', 'chat-uploads') : path.join(__dirname, 'uploads');
 const AVATAR_DIR = path.join(UPLOAD_DIR, 'avatars');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
-const FILES_FILE = path.join(DATA_DIR, 'files.json');
 
-// ---------- bootstrap data files/folders ----------
-for (const dir of [DATA_DIR, UPLOAD_DIR, AVATAR_DIR]) {
+// Bootstrap upload directories
+for (const dir of [UPLOAD_DIR, AVATAR_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
-for (const [file, initial] of [[USERS_FILE, {}], [MESSAGES_FILE, []], [FILES_FILE, []]]) {
-  if (!fs.existsSync(file)) {
-    const seedPath = path.join(__dirname, 'data', path.basename(file));
-    if (IS_VERCEL && fs.existsSync(seedPath)) {
-      try {
-        fs.copyFileSync(seedPath, file);
-      } catch (e) {
-        fs.writeFileSync(file, JSON.stringify(initial, null, 2));
-      }
-    } else {
-      fs.writeFileSync(file, JSON.stringify(initial, null, 2));
-    }
-  }
-}
 
-function readJSON(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    return file === USERS_FILE ? {} : [];
-  }
-}
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-
-// ---------- seed admin user ----------
-function ensureAdminUser() {
-  const users = readJSON(USERS_FILE);
-  const current = users[ADMIN_USERNAME];
-  if (!current) {
-    users[ADMIN_USERNAME] = {
-      passwordHash: bcrypt.hashSync(ADMIN_PASSWORD, 10),
-      createdAt: Date.now(),
-      isAdmin: true,
-      isBlocked: false
-    };
-    writeJSON(USERS_FILE, users);
-    console.log(`Admin user "${ADMIN_USERNAME}" seeded successfully.`);
-  } else {
-    users[ADMIN_USERNAME].isAdmin = true;
-    users[ADMIN_USERNAME].isBlocked = false;
-    if (!bcrypt.compareSync(ADMIN_PASSWORD, current.passwordHash)) {
-      users[ADMIN_USERNAME].passwordHash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
-    }
-    writeJSON(USERS_FILE, users);
-  }
-}
-ensureAdminUser();
+// Seed & synchronize admin user and local seed accounts
+db.seedAndSync({
+  adminUsername: ADMIN_USERNAME,
+  adminPasswordHash: bcrypt.hashSync(ADMIN_PASSWORD, 10),
+  seedPath: path.join(__dirname, 'data', 'users.json')
+}).catch(err => console.error('Database seed error:', err.message));
 
 function escapeXml(str) {
   return String(str || '')
@@ -101,14 +57,14 @@ function generateDefaultAvatarSvg(username) {
   const initials = (name.length >= 2 ? name.slice(0, 2) : name).toUpperCase();
   
   const palettes = [
-    ['#4f46e5', '#7c3aed'], // indigo to purple
-    ['#2563eb', '#06b6d4'], // blue to cyan
-    ['#059669', '#10b981'], // emerald to teal
-    ['#d97706', '#ea580c'], // amber to orange
-    ['#db2777', '#f43f5e'], // pink to rose
-    ['#0891b2', '#0284c7'], // cyan to sky
-    ['#9333ea', '#c026d3'], // purple to fuchsia
-    ['#16a34a', '#84cc16']  // green to lime
+    ['#4f46e5', '#7c3aed'],
+    ['#2563eb', '#06b6d4'],
+    ['#059669', '#10b981'],
+    ['#d97706', '#ea580c'],
+    ['#db2777', '#f43f5e'],
+    ['#0891b2', '#0284c7'],
+    ['#9333ea', '#c026d3'],
+    ['#16a34a', '#84cc16']
   ];
   
   let hash = 0;
@@ -139,6 +95,10 @@ function getUserAvatarUrl(userRecord, username) {
   return `/api/avatar/${encodeURIComponent(username)}`;
 }
 
+function roomKeyFor(a, b) {
+  return [a, b].sort((x, y) => x.localeCompare(y)).join('::');
+}
+
 // ---------- express app ----------
 const app = express();
 const server = http.createServer(app);
@@ -162,10 +122,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 // in-memory map of live socket auth tokens -> username (issued at login)
 const socketTokens = new Map();
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   if (!req.session.username) return res.status(401).json({ error: 'Not logged in' });
-  const users = readJSON(USERS_FILE);
-  const user = users[req.session.username];
+  const user = await db.getUser(req.session.username);
   if (!user) return res.status(401).json({ error: 'User account not found' });
   if (user.isBlocked) {
     req.session.destroy(() => {});
@@ -174,10 +133,9 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   if (!req.session.username) return res.status(401).json({ error: 'Not logged in' });
-  const users = readJSON(USERS_FILE);
-  const user = users[req.session.username];
+  const user = await db.getUser(req.session.username);
   if (!user || !user.isAdmin) {
     return res.status(403).json({ error: 'Access denied: Admin privileges required.' });
   }
@@ -186,68 +144,75 @@ function requireAdmin(req, res, next) {
 
 // ---------- AUTH ROUTES ----------
 
-app.post('/api/register', (req, res) => {
-  let { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-  username = String(username).trim();
-  if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(username)) {
-    return res.status(400).json({ error: 'Username must be 3-20 chars: letters, numbers, _ . -' });
-  }
-  if (String(password).length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
+app.post('/api/register', async (req, res) => {
+  try {
+    let { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+    username = String(username).trim();
+    if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(username)) {
+      return res.status(400).json({ error: 'Username must be 3-20 chars: letters, numbers, _ . -' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
 
-  const users = readJSON(USERS_FILE);
-  const exists = Object.keys(users).some(u => u.toLowerCase() === username.toLowerCase());
-  if (exists) {
-    return res.status(409).json({ error: 'That username is already taken' });
+    const exists = await db.findUserCaseInsensitive(username);
+    if (exists) {
+      return res.status(409).json({ error: 'That username is already taken' });
+    }
+
+    const passwordHash = bcrypt.hashSync(password, 10);
+    const newUser = await db.saveUser(username, {
+      passwordHash,
+      createdAt: Date.now(),
+      isAdmin: false,
+      isBlocked: false
+    });
+
+    const initialAvatarUrl = getUserAvatarUrl(newUser, username);
+    io.emit('new-user', { username, avatarUrl: initialAvatarUrl });
+
+    res.json({ ok: true, message: 'Account created. You can now log in.' });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Failed to create account. Please try again.' });
   }
-
-  const passwordHash = bcrypt.hashSync(password, 10);
-  users[username] = {
-    passwordHash,
-    createdAt: Date.now(),
-    isAdmin: false,
-    isBlocked: false
-  };
-  writeJSON(USERS_FILE, users);
-
-  const initialAvatarUrl = getUserAvatarUrl(users[username], username);
-  io.emit('new-user', { username, avatarUrl: initialAvatarUrl });
-
-  res.json({ ok: true, message: 'Account created. You can now log in.' });
 });
 
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-  const users = readJSON(USERS_FILE);
-  const record = users[username];
-  if (!record || !bcrypt.compareSync(password, record.passwordHash)) {
-    return res.status(401).json({ error: 'Invalid username or password' });
-  }
-  if (record.isBlocked) {
-    return res.status(403).json({ error: 'Your account has been blocked by the admin.' });
-  }
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+    const record = await db.getUser(username);
+    if (!record || !bcrypt.compareSync(password, record.passwordHash)) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+    if (record.isBlocked) {
+      return res.status(403).json({ error: 'Your account has been blocked by the admin.' });
+    }
 
-  req.session.username = username;
-  req.session.isAdmin = !!record.isAdmin;
-  const token = nanoid();
-  socketTokens.set(token, username);
-  req.session.socketToken = token;
+    req.session.username = record.username;
+    req.session.isAdmin = !!record.isAdmin;
+    const token = nanoid();
+    socketTokens.set(token, record.username);
+    req.session.socketToken = token;
 
-  const avatarUrl = getUserAvatarUrl(record, username);
-  res.json({
-    ok: true,
-    username,
-    isAdmin: !!record.isAdmin,
-    socketToken: token,
-    avatarUrl
-  });
+    const avatarUrl = getUserAvatarUrl(record, record.username);
+    res.json({
+      ok: true,
+      username: record.username,
+      isAdmin: !!record.isAdmin,
+      socketToken: token,
+      avatarUrl
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
 });
 
 app.post('/api/logout', (req, res) => {
@@ -256,25 +221,24 @@ app.post('/api/logout', (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
-app.get('/api/me', requireAuth, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const user = users[req.session.username];
+app.get('/api/me', requireAuth, async (req, res) => {
+  const user = await db.getUser(req.session.username);
   const avatarUrl = getUserAvatarUrl(user, req.session.username);
   res.json({
     username: req.session.username,
-    isAdmin: !!user.isAdmin,
+    isAdmin: !!(user && user.isAdmin),
     socketToken: req.session.socketToken,
     avatarUrl
   });
 });
 
-app.get('/api/users', requireAuth, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const list = Object.keys(users)
-    .filter(u => u !== req.session.username && !users[u].isBlocked)
+app.get('/api/users', requireAuth, async (req, res) => {
+  const users = await db.getAllUsersList();
+  const list = users
+    .filter(u => u.username !== req.session.username && !u.isBlocked)
     .map(u => ({
-      username: u,
-      avatarUrl: getUserAvatarUrl(users[u], u)
+      username: u.username,
+      avatarUrl: getUserAvatarUrl(u, u.username)
     }));
   res.json({ users: list });
 });
@@ -303,27 +267,28 @@ const avatarUpload = multer({
 });
 
 app.post('/api/profile/avatar', requireAuth, (req, res) => {
-  avatarUpload.single('avatar')(req, res, (err) => {
+  avatarUpload.single('avatar')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message || 'Avatar upload failed' });
     if (!req.file) return res.status(400).json({ error: 'No image file uploaded' });
 
     const username = req.session.username;
-    const users = readJSON(USERS_FILE);
-    if (!users[username]) return res.status(404).json({ error: 'User not found' });
+    const user = await db.getUser(username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     // clean up previous uploaded avatar file
-    if (users[username].avatarFile) {
-      const oldPath = path.join(AVATAR_DIR, users[username].avatarFile);
+    if (user.avatarFile) {
+      const oldPath = path.join(AVATAR_DIR, user.avatarFile);
       if (fs.existsSync(oldPath)) {
         try { fs.unlinkSync(oldPath); } catch (e) {}
       }
     }
 
-    users[username].avatarFile = req.file.filename;
-    users[username].avatarUpdatedAt = Date.now();
-    writeJSON(USERS_FILE, users);
+    const updated = await db.saveUser(username, {
+      avatarFile: req.file.filename,
+      avatarUpdatedAt: Date.now()
+    });
 
-    const avatarUrl = getUserAvatarUrl(users[username], username);
+    const avatarUrl = getUserAvatarUrl(updated, username);
 
     // broadcast avatar update to all connected clients
     io.emit('avatar-updated', { username, avatarUrl });
@@ -332,10 +297,9 @@ app.post('/api/profile/avatar', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/avatar/:username', (req, res) => {
+app.get('/api/avatar/:username', async (req, res) => {
   const username = req.params.username;
-  const users = readJSON(USERS_FILE);
-  const user = users[username];
+  const user = await db.getUser(username);
 
   if (user && user.avatarFile) {
     const filePath = path.join(AVATAR_DIR, user.avatarFile);
@@ -354,25 +318,21 @@ app.get('/api/avatar/:username', (req, res) => {
 
 // ---------- CHAT HISTORY ----------
 
-function roomKeyFor(a, b) {
-  return [a, b].sort((x, y) => x.localeCompare(y)).join('::');
-}
-
-app.get('/api/messages/:withUser', requireAuth, (req, res) => {
+app.get('/api/messages/:withUser', requireAuth, async (req, res) => {
   const me = req.session.username;
   const other = req.params.withUser;
-  const key = roomKeyFor(me, other);
-  const all = readJSON(MESSAGES_FILE);
-  const users = readJSON(USERS_FILE);
-  const thread = all.filter(m => roomKeyFor(m.from, m.to) === key).map(m => ({
+  const thread = await db.getMessagesThread(me, other);
+  const usersMap = await db.getAllUsersMap();
+
+  const enriched = thread.map(m => ({
     ...m,
-    avatarUrl: m.avatarUrl || getUserAvatarUrl(users[m.from], m.from)
+    avatarUrl: m.avatarUrl || getUserAvatarUrl(usersMap[m.from], m.from)
   }));
-  res.json({ messages: thread });
+  res.json({ messages: enriched });
 });
 
-// HTTP fallback endpoint for sending messages (essential for serverless platforms like Vercel)
-app.post('/api/messages', requireAuth, (req, res) => {
+// HTTP fallback endpoint for sending messages
+app.post('/api/messages', requireAuth, async (req, res) => {
   const me = req.session.username;
   const { to, text } = req.body || {};
   const cleanText = String(text || '').trim();
@@ -381,15 +341,15 @@ app.post('/api/messages', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Recipient and message text are required' });
   }
 
-  const users = readJSON(USERS_FILE);
-  if (!users[to]) {
+  const recipient = await db.getUser(to);
+  if (!recipient) {
     return res.status(404).json({ error: `User "${to}" does not exist` });
   }
-  if (users[to].isBlocked) {
+  if (recipient.isBlocked) {
     return res.status(403).json({ error: `Cannot message "${to}" because this account is blocked.` });
   }
 
-  const sender = users[me];
+  const sender = await db.getUser(me);
   const avatarUrl = getUserAvatarUrl(sender, me);
 
   const message = {
@@ -401,9 +361,7 @@ app.post('/api/messages', requireAuth, (req, res) => {
     timestamp: Date.now()
   };
 
-  const all = readJSON(MESSAGES_FILE);
-  all.push(message);
-  writeJSON(MESSAGES_FILE, all);
+  await db.saveMessage(message);
 
   // Broadcast to Socket.IO if available/connected
   try {
@@ -425,22 +383,21 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB cap
 
-app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/upload', requireAuth, upload.single('file'), async (req, res) => {
   const me = req.session.username;
   const to = req.body.to;
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  const users = readJSON(USERS_FILE);
-  if (!to || !users[to]) {
+  const recipient = await db.getUser(to);
+  if (!to || !recipient) {
     fs.unlinkSync(req.file.path);
     return res.status(400).json({ error: 'Recipient username does not exist' });
   }
-  if (users[to].isBlocked) {
+  if (recipient.isBlocked) {
     fs.unlinkSync(req.file.path);
     return res.status(403).json({ error: 'Cannot send files to a blocked user' });
   }
 
-  const filesDb = readJSON(FILES_FILE);
   const record = {
     id: nanoid(),
     storedName: req.file.filename,
@@ -450,8 +407,7 @@ app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
     to,
     uploadedAt: Date.now()
   };
-  filesDb.push(record);
-  writeJSON(FILES_FILE, filesDb);
+  await db.saveFile(record);
 
   // notify recipient live if connected
   io.to(to).emit('file-shared', record);
@@ -460,20 +416,17 @@ app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
 });
 
 // list files visible to me (sent by me or sent to me)
-app.get('/api/files', requireAuth, (req, res) => {
+app.get('/api/files', requireAuth, async (req, res) => {
   const me = req.session.username;
-  const filesDb = readJSON(FILES_FILE);
-  const mine = filesDb.filter(f => f.from === me || f.to === me)
-    .sort((a, b) => b.uploadedAt - a.uploadedAt);
+  const mine = await db.getUserFiles(me);
   res.json({ files: mine });
 });
 
-app.get('/api/files/:id/download', requireAuth, (req, res) => {
+app.get('/api/files/:id/download', requireAuth, async (req, res) => {
   const me = req.session.username;
-  const users = readJSON(USERS_FILE);
-  const isAdmin = users[me] && users[me].isAdmin;
-  const filesDb = readJSON(FILES_FILE);
-  const record = filesDb.find(f => f.id === req.params.id);
+  const user = await db.getUser(me);
+  const isAdmin = user && user.isAdmin;
+  const record = await db.getFile(req.params.id);
   if (!record) return res.status(404).send('File not found');
   if (!isAdmin && record.from !== me && record.to !== me) {
     return res.status(403).send('You do not have access to this file');
@@ -488,14 +441,13 @@ app.get('/api/files/:id/download', requireAuth, (req, res) => {
 // ==========================================
 
 // 1. Get stats
-app.get('/api/admin/stats', requireAdmin, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const messages = readJSON(MESSAGES_FILE);
-  const files = readJSON(FILES_FILE);
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  const users = await db.getAllUsersList();
+  const messages = await db.getAllMessages();
+  const files = await db.getAllFiles();
 
-  const usernames = Object.keys(users);
-  const totalUsers = usernames.length;
-  const blockedUsers = usernames.filter(u => users[u].isBlocked).length;
+  const totalUsers = users.length;
+  const blockedUsers = users.filter(u => u.isBlocked).length;
   const activeUsers = totalUsers - blockedUsers;
 
   res.json({
@@ -508,29 +460,28 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
 });
 
 // 2. Get all users
-app.get('/api/admin/users', requireAdmin, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const list = Object.keys(users).map(u => ({
-    username: u,
-    avatarUrl: getUserAvatarUrl(users[u], u),
-    createdAt: users[u].createdAt || Date.now(),
-    isAdmin: !!users[u].isAdmin,
-    isBlocked: !!users[u].isBlocked
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  const users = await db.getAllUsersList();
+  const list = users.map(u => ({
+    username: u.username,
+    avatarUrl: getUserAvatarUrl(u, u.username),
+    createdAt: u.createdAt || Date.now(),
+    isAdmin: !!u.isAdmin,
+    isBlocked: !!u.isBlocked
   }));
   res.json({ users: list });
 });
 
 // 3. Block user
-app.post('/api/admin/users/:username/block', requireAdmin, (req, res) => {
+app.post('/api/admin/users/:username/block', requireAdmin, async (req, res) => {
   const target = req.params.username;
   if (target === ADMIN_USERNAME) {
     return res.status(400).json({ error: 'Cannot block the primary admin account' });
   }
-  const users = readJSON(USERS_FILE);
-  if (!users[target]) return res.status(404).json({ error: 'User not found' });
+  const user = await db.getUser(target);
+  if (!user) return res.status(404).json({ error: 'User not found' });
 
-  users[target].isBlocked = true;
-  writeJSON(USERS_FILE, users);
+  await db.saveUser(target, { isBlocked: true });
 
   // Real-time disconnect and notify target user
   io.to(target).emit('account-blocked', { reason: 'Your account has been blocked by the admin.' });
@@ -547,37 +498,35 @@ app.post('/api/admin/users/:username/block', requireAdmin, (req, res) => {
 });
 
 // 4. Unblock user
-app.post('/api/admin/users/:username/unblock', requireAdmin, (req, res) => {
+app.post('/api/admin/users/:username/unblock', requireAdmin, async (req, res) => {
   const target = req.params.username;
-  const users = readJSON(USERS_FILE);
-  if (!users[target]) return res.status(404).json({ error: 'User not found' });
+  const user = await db.getUser(target);
+  if (!user) return res.status(404).json({ error: 'User not found' });
 
-  users[target].isBlocked = false;
-  writeJSON(USERS_FILE, users);
+  await db.saveUser(target, { isBlocked: false });
 
   io.emit('admin-user-updated', { username: target, isBlocked: false });
   res.json({ ok: true, message: `User "${target}" has been unblocked.` });
 });
 
 // 5. Delete user
-app.delete('/api/admin/users/:username', requireAdmin, (req, res) => {
+app.delete('/api/admin/users/:username', requireAdmin, async (req, res) => {
   const target = req.params.username;
   if (target === ADMIN_USERNAME) {
     return res.status(400).json({ error: 'Cannot delete the primary admin account' });
   }
-  const users = readJSON(USERS_FILE);
-  if (!users[target]) return res.status(404).json({ error: 'User not found' });
+  const user = await db.getUser(target);
+  if (!user) return res.status(404).json({ error: 'User not found' });
 
   // Delete custom avatar file if present
-  if (users[target].avatarFile) {
-    const avatarPath = path.join(AVATAR_DIR, users[target].avatarFile);
+  if (user.avatarFile) {
+    const avatarPath = path.join(AVATAR_DIR, user.avatarFile);
     if (fs.existsSync(avatarPath)) {
       try { fs.unlinkSync(avatarPath); } catch (e) {}
     }
   }
 
-  delete users[target];
-  writeJSON(USERS_FILE, users);
+  await db.deleteUser(target);
 
   // Notify and disconnect user
   io.to(target).emit('account-deleted');
@@ -594,10 +543,9 @@ app.delete('/api/admin/users/:username', requireAdmin, (req, res) => {
 });
 
 // 6. Get all conversations summary
-app.get('/api/admin/conversations', requireAdmin, (req, res) => {
-  const messages = readJSON(MESSAGES_FILE);
-  const files = readJSON(FILES_FILE);
-  const users = readJSON(USERS_FILE);
+app.get('/api/admin/conversations', requireAdmin, async (req, res) => {
+  const messages = await db.getAllMessages();
+  const files = await db.getAllFiles();
 
   const threads = new Map();
 
@@ -648,43 +596,39 @@ app.get('/api/admin/conversations', requireAdmin, (req, res) => {
 });
 
 // 7. Inspect conversation between two users
-app.get('/api/admin/messages/:userA/:userB', requireAdmin, (req, res) => {
+app.get('/api/admin/messages/:userA/:userB', requireAdmin, async (req, res) => {
   const { userA, userB } = req.params;
-  const key = roomKeyFor(userA, userB);
-  const allMessages = readJSON(MESSAGES_FILE);
-  const allFiles = readJSON(FILES_FILE);
-  const users = readJSON(USERS_FILE);
+  const threadMessages = await db.getMessagesThread(userA, userB);
+  const allFiles = await db.getAllFiles();
+  const usersMap = await db.getAllUsersMap();
 
-  const threadMessages = allMessages.filter(m => roomKeyFor(m.from, m.to) === key).map(m => ({
+  const enrichedMessages = threadMessages.map(m => ({
     ...m,
-    avatarUrl: m.avatarUrl || getUserAvatarUrl(users[m.from], m.from)
+    avatarUrl: m.avatarUrl || getUserAvatarUrl(usersMap[m.from], m.from)
   }));
 
+  const key = roomKeyFor(userA, userB);
   const threadFiles = allFiles.filter(f => roomKeyFor(f.from, f.to) === key);
 
-  res.json({ messages: threadMessages, files: threadFiles });
+  res.json({ messages: enrichedMessages, files: threadFiles });
 });
 
 // 8. Admin delete message
-app.delete('/api/admin/messages/:id', requireAdmin, (req, res) => {
-  const all = readJSON(MESSAGES_FILE);
-  const filtered = all.filter(m => m.id !== req.params.id);
-  writeJSON(MESSAGES_FILE, filtered);
+app.delete('/api/admin/messages/:id', requireAdmin, async (req, res) => {
+  await db.deleteMessage(req.params.id);
   res.json({ ok: true });
 });
 
 // 9. Admin delete file
-app.delete('/api/admin/files/:id', requireAdmin, (req, res) => {
-  const all = readJSON(FILES_FILE);
-  const file = all.find(f => f.id === req.params.id);
+app.delete('/api/admin/files/:id', requireAdmin, async (req, res) => {
+  const file = await db.getFile(req.params.id);
   if (file) {
     const fullPath = path.join(UPLOAD_DIR, file.storedName);
     if (fs.existsSync(fullPath)) {
       try { fs.unlinkSync(fullPath); } catch (e) {}
     }
   }
-  const filtered = all.filter(f => f.id !== req.params.id);
-  writeJSON(FILES_FILE, filtered);
+  await db.deleteFile(req.params.id);
   res.json({ ok: true });
 });
 
@@ -695,19 +639,22 @@ app.get('/', (req, res) => {
 
 // ---------- SOCKET.IO (real-time chat) ----------
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth && socket.handshake.auth.token;
-  const username = socketTokens.get(token);
-  if (!username) return next(new Error('Unauthorized socket connection'));
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth && socket.handshake.auth.token;
+    const username = socketTokens.get(token);
+    if (!username) return next(new Error('Unauthorized socket connection'));
 
-  const users = readJSON(USERS_FILE);
-  const user = users[username];
-  if (!user) return next(new Error('User account not found'));
-  if (user.isBlocked) return next(new Error('Account is blocked by admin'));
+    const user = await db.getUser(username);
+    if (!user) return next(new Error('User account not found'));
+    if (user.isBlocked) return next(new Error('Account is blocked by admin'));
 
-  socket.username = username;
-  socket.isAdmin = !!user.isAdmin;
-  next();
+    socket.username = username;
+    socket.isAdmin = !!user.isAdmin;
+    next();
+  } catch (err) {
+    next(new Error('Authentication failed'));
+  }
 });
 
 io.on('connection', (socket) => {
@@ -716,39 +663,41 @@ io.on('connection', (socket) => {
     socket.join('admin-room');
   }
 
-  socket.on('private-message', (payload) => {
-    const to = payload && payload.to;
-    const text = payload && String(payload.text || '').trim();
-    if (!to || !text) return;
+  socket.on('private-message', async (payload) => {
+    try {
+      const to = payload && payload.to;
+      const text = payload && String(payload.text || '').trim();
+      if (!to || !text) return;
 
-    const users = readJSON(USERS_FILE);
-    if (!users[to]) {
-      socket.emit('error-message', { error: `User "${to}" does not exist` });
-      return;
+      const recipient = await db.getUser(to);
+      if (!recipient) {
+        socket.emit('error-message', { error: `User "${to}" does not exist` });
+        return;
+      }
+      if (recipient.isBlocked) {
+        socket.emit('error-message', { error: `Cannot message "${to}" because this account is blocked.` });
+        return;
+      }
+
+      const sender = await db.getUser(socket.username);
+      const avatarUrl = getUserAvatarUrl(sender, socket.username);
+
+      const message = {
+        id: nanoid(),
+        from: socket.username,
+        to,
+        text,
+        avatarUrl,
+        timestamp: Date.now()
+      };
+
+      await db.saveMessage(message);
+
+      io.to(to).emit('private-message', message);
+      io.to(socket.username).emit('private-message', message); // echo to sender (other tabs)
+    } catch (err) {
+      console.error('Socket message error:', err);
     }
-    if (users[to].isBlocked) {
-      socket.emit('error-message', { error: `Cannot message "${to}" because this account is blocked.` });
-      return;
-    }
-
-    const sender = users[socket.username];
-    const avatarUrl = getUserAvatarUrl(sender, socket.username);
-
-    const message = {
-      id: nanoid(),
-      from: socket.username,
-      to,
-      text,
-      avatarUrl,
-      timestamp: Date.now()
-    };
-
-    const all = readJSON(MESSAGES_FILE);
-    all.push(message);
-    writeJSON(MESSAGES_FILE, all);
-
-    io.to(to).emit('private-message', message);
-    io.to(socket.username).emit('private-message', message); // echo to sender (other tabs)
   });
 
   socket.on('typing', ({ to }) => {

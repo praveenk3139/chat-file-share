@@ -1,0 +1,16 @@
+{
+  "praveen": {
+    "passwordHash": "$2a$10$O956oNfaKSwRxEL.M1jVpebOCUVmLZu5O00Lv3LI0pS3n8dkLiC/u",
+    "createdAt": 1788529442182,
+    "isAdmin": true,
+    "isBlocked": false,
+    "avatarFile": "avatar_praveen_1788529759786.jpg",
+    "avatarUpdatedAt": 1788529759803
+  },
+  "praveenkumar": {
+    "passwordHash": "$2a$10$nM.UT29dT.Zh8nN5YIakzuHVn80Lp6zEdspKaVQ24S5FyGVk/4f4O",
+    "createdAt": 1788529661180,
+    "isAdmin": false,
+    "isBlocked": false
+  }
+}
