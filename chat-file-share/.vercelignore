@@ -1,0 +1,7 @@
+.git
+node_modules
+.env
+uploads/*
+!uploads/.gitkeep
+scratch
+*.log
