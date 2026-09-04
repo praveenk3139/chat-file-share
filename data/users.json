@@ -6,29 +6,5 @@
     "isBlocked": false,
     "avatarFile": "avatar_praveen_1788529759786.jpg",
     "avatarUpdatedAt": 1788529759803
-  },
-  "praveenkumar": {
-    "passwordHash": "$2a$10$nM.UT29dT.Zh8nN5YIakzuHVn80Lp6zEdspKaVQ24S5FyGVk/4f4O",
-    "createdAt": 1788529661180,
-    "isAdmin": false,
-    "isBlocked": false
-  },
-  "alex": {
-    "passwordHash": "$2a$10$GG4..34SyGS3vPPPQwo/E.kh7e5Ubk8CiB1WDTKqt9vjSmbFKVZjO",
-    "createdAt": 1788547574791,
-    "isAdmin": false,
-    "isBlocked": false
-  },
-  "sarah": {
-    "passwordHash": "$2a$10$zXpD6ey9mFRpI7tZ8cgVceSD7xu82Ug877DzGgb0hiPKdX2s108DC",
-    "createdAt": 1788547574843,
-    "isAdmin": false,
-    "isBlocked": false
-  },
-  "vikram": {
-    "passwordHash": "$2a$10$bKVJ8S64/55d0UKP1.PSbu1uC.8b7cHMI2TYqMusUpPpE37GD1slq",
-    "createdAt": 1788547574895,
-    "isAdmin": false,
-    "isBlocked": false
   }
 }
