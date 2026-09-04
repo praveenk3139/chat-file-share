@@ -345,9 +345,11 @@ async function seedAndSync({ adminUsername, adminPasswordHash, seedPath }) {
     // Local file fallback seeding
     const users = readJSON(USERS_FILE, {});
     
-    // Merge seed file if USERS_FILE was empty
-    if (Object.keys(users).length === 0 && Object.keys(localUsers).length > 0) {
-      Object.assign(users, localUsers);
+    // Merge any missing seed users into USERS_FILE
+    for (const [uname, udata] of Object.entries(localUsers)) {
+      if (!users[uname]) {
+        users[uname] = udata;
+      }
     }
 
     const current = users[adminUsername];

@@ -18,10 +18,53 @@ const multer = require('multer');
 const { nanoid } = require('nanoid');
 const http = require('http');
 const { Server } = require('socket.io');
+const crypto = require('crypto');
 const db = require('./db');
 
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change-this-secret-in-production';
+
+function signToken(payload) {
+  const jsonStr = JSON.stringify(payload);
+  const b64 = Buffer.from(jsonStr).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('base64url');
+  return `${b64}.${sig}`;
+}
+
+function verifyToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [b64, sig] = parts;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(b64).digest('base64url');
+  if (sig !== expected) return null;
+  try {
+    return JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function getAuthUser(req) {
+  if (req.session && req.session.username) {
+    return { username: req.session.username, isAdmin: !!req.session.isAdmin };
+  }
+  const cookieHeader = req.headers && req.headers.cookie;
+  if (cookieHeader) {
+    const match = cookieHeader.match(/(?:^|;\s*)auth_token=([^;]+)/);
+    if (match) {
+      const payload = verifyToken(match[1]);
+      if (payload && payload.username) {
+        if (req.session) {
+          req.session.username = payload.username;
+          req.session.isAdmin = !!payload.isAdmin;
+        }
+        return payload;
+      }
+    }
+  }
+  return null;
+}
 
 const ADMIN_USERNAME = 'praveen';
 const ADMIN_PASSWORD = '3139';
@@ -119,26 +162,46 @@ app.use(sessionMiddleware);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// in-memory map of live socket auth tokens -> username (issued at login)
+// In-flight socket auth tokens -> username (issued at login)
 const socketTokens = new Map();
 
+// Seamless auth restoration middleware for multi-instance serverless (Vercel)
+app.use((req, res, next) => {
+  const auth = getAuthUser(req);
+  if (auth) {
+    req.authUser = auth;
+    if (req.session && !req.session.username) {
+      req.session.username = auth.username;
+      req.session.isAdmin = !!auth.isAdmin;
+    }
+  }
+  next();
+});
+
 async function requireAuth(req, res, next) {
-  if (!req.session.username) return res.status(401).json({ error: 'Not logged in' });
-  const user = await db.getUser(req.session.username);
+  const auth = getAuthUser(req);
+  const username = (auth && auth.username) || (req.session && req.session.username);
+  if (!username) return res.status(401).json({ error: 'Not logged in' });
+  const user = await db.getUser(username);
   if (!user) return res.status(401).json({ error: 'User account not found' });
   if (user.isBlocked) {
-    req.session.destroy(() => {});
+    if (req.session) req.session.destroy(() => {});
+    res.clearCookie('auth_token');
     return res.status(403).json({ error: 'Your account has been blocked by the admin.' });
   }
+  req.user = user;
   next();
 }
 
 async function requireAdmin(req, res, next) {
-  if (!req.session.username) return res.status(401).json({ error: 'Not logged in' });
-  const user = await db.getUser(req.session.username);
+  const auth = getAuthUser(req);
+  const username = (auth && auth.username) || (req.session && req.session.username);
+  if (!username) return res.status(401).json({ error: 'Not logged in' });
+  const user = await db.getUser(username);
   if (!user || !user.isAdmin) {
     return res.status(403).json({ error: 'Access denied: Admin privileges required.' });
   }
+  req.user = user;
   next();
 }
 
@@ -201,6 +264,14 @@ app.post('/api/login', async (req, res) => {
     socketTokens.set(token, record.username);
     req.session.socketToken = token;
 
+    // Set signed token cookie to survive across serverless lambda containers
+    const authToken = signToken({ username: record.username, isAdmin: !!record.isAdmin });
+    res.cookie('auth_token', authToken, {
+      httpOnly: true,
+      maxAge: 1000 * 60 * 60 * 24 * 7,
+      sameSite: 'lax'
+    });
+
     const avatarUrl = getUserAvatarUrl(record, record.username);
     res.json({
       ok: true,
@@ -216,27 +287,33 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  const token = req.session.socketToken;
+  const token = req.session && req.session.socketToken;
   if (token) socketTokens.delete(token);
-  req.session.destroy(() => res.json({ ok: true }));
+  res.clearCookie('auth_token');
+  if (req.session) {
+    req.session.destroy(() => res.json({ ok: true }));
+  } else {
+    res.json({ ok: true });
+  }
 });
 
 app.get('/api/me', requireAuth, async (req, res) => {
-  const user = await db.getUser(req.session.username);
-  const avatarUrl = getUserAvatarUrl(user, req.session.username);
+  const user = req.user;
+  const avatarUrl = getUserAvatarUrl(user, user.username);
   res.json({
-    username: req.session.username,
-    isAdmin: !!(user && user.isAdmin),
-    socketToken: req.session.socketToken,
+    username: user.username,
+    isAdmin: !!user.isAdmin,
+    socketToken: (req.session && req.session.socketToken) || nanoid(),
     avatarUrl
   });
 });
 
 app.get('/api/users', requireAuth, async (req, res) => {
   try {
+    const currentUsername = req.user.username;
     const users = await db.getAllUsersList();
     const list = users
-      .filter(u => u.username !== req.session.username && !u.isBlocked)
+      .filter(u => u.username !== currentUsername && !u.isBlocked)
       .map(u => ({
         username: u.username,
         avatarUrl: getUserAvatarUrl(u, u.username)
@@ -336,9 +413,9 @@ app.get('/api/messages/:withUser', requireAuth, async (req, res) => {
   res.json({ messages: enriched });
 });
 
-// HTTP fallback endpoint for sending messages
-app.post('/api/messages', requireAuth, async (req, res) => {
-  const me = req.session.username;
+// HTTP fallback endpoint for sending messages (also handles /api/messages/send)
+const handleSendMessage = async (req, res) => {
+  const me = req.user ? req.user.username : (req.session && req.session.username);
   const { to, text } = req.body || {};
   const cleanText = String(text || '').trim();
 
@@ -354,7 +431,7 @@ app.post('/api/messages', requireAuth, async (req, res) => {
     return res.status(403).json({ error: `Cannot message "${to}" because this account is blocked.` });
   }
 
-  const sender = await db.getUser(me);
+  const sender = req.user || await db.getUser(me);
   const avatarUrl = getUserAvatarUrl(sender, me);
 
   const message = {
@@ -375,7 +452,10 @@ app.post('/api/messages', requireAuth, async (req, res) => {
   } catch (e) {}
 
   res.json({ ok: true, message });
-});
+};
+
+app.post('/api/messages', requireAuth, handleSendMessage);
+app.post('/api/messages/send', requireAuth, handleSendMessage);
 
 // ---------- FILE SHARING ----------
 
@@ -639,7 +719,8 @@ app.delete('/api/admin/files/:id', requireAdmin, async (req, res) => {
 
 // ---------- fallback routes for pages ----------
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', req.session.username ? 'dashboard.html' : 'login.html'));
+  const auth = getAuthUser(req);
+  res.sendFile(path.join(__dirname, 'public', auth ? 'dashboard.html' : 'login.html'));
 });
 
 // ---------- SOCKET.IO (real-time chat) ----------

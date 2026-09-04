@@ -3,6 +3,9 @@ let socket = null;
 let activeUser = null;
 const userAvatars = new Map();
 const messageReactions = new Map(); // msgId -> { [emoji]: count }
+const renderedMessageIds = new Set();
+const renderedFileIds = new Set();
+let chatPollInterval = null;
 
 // General UI elements
 const userListEl = document.getElementById('userList');
@@ -121,91 +124,112 @@ async function init() {
   localStorage.removeItem('chatshare_bg_opacity');
   document.body.removeAttribute('data-theme');
 
-  socket = io({
-    auth: { token: me.socketToken },
-    reconnectionAttempts: 5,
-    timeout: 5000,
-    transports: ['websocket', 'polling']
-  });
+  if (typeof io !== 'undefined') {
+    try {
+      socket = io({
+        auth: { token: me.socketToken },
+        reconnectionAttempts: 5,
+        timeout: 5000,
+        transports: ['websocket', 'polling']
+      });
 
-  socket.on('private-message', (msg) => {
-    if (activeUser && (msg.from === activeUser || msg.to === activeUser)) {
-      renderMessage(msg);
-      scrollToBottom();
+      socket.on('private-message', (msg) => {
+        if (activeUser && (msg.from === activeUser || msg.to === activeUser)) {
+          if (!renderedMessageIds.has(msg.id)) {
+            renderMessage(msg);
+            scrollToBottom();
+          }
+        }
+      });
+
+      socket.on('file-shared', (file) => {
+        if (activeUser && (file.from === activeUser || file.to === activeUser)) {
+          if (!renderedFileIds.has(file.id)) {
+            renderFile(file);
+            scrollToBottom();
+          }
+        }
+      });
+
+      socket.on('avatar-updated', ({ username, avatarUrl }) => {
+        userAvatars.set(username, avatarUrl);
+        if (me && username === me.username) {
+          me.avatarUrl = avatarUrl;
+          myAvatarImg.src = avatarUrl;
+        }
+        // Update sidebar list avatar
+        const contactImg = document.querySelector(`.user-item[data-username="${username}"] .avatar-img`);
+        if (contactImg) contactImg.src = avatarUrl;
+
+        // Update active chat header avatar
+        if (activeUser === username && chatHeaderAvatar) {
+          chatHeaderAvatar.src = avatarUrl;
+        }
+
+        // Update timeline avatars for this user
+        document.querySelectorAll(`.msg-avatar[data-username="${username}"]`).forEach(img => {
+          img.src = avatarUrl;
+        });
+
+        if (me && me.isAdmin) {
+          loadAdminUsers();
+        }
+      });
+
+      socket.on('new-user', ({ username, avatarUrl }) => {
+        userAvatars.set(username, avatarUrl);
+        loadUsers();
+        if (me && me.isAdmin) loadAdminData();
+      });
+
+      socket.on('user-deleted', ({ username }) => {
+        userAvatars.delete(username);
+        if (activeUser === username) {
+          activeUser = null;
+          chatHeaderTitle.textContent = 'Select a user to start chatting';
+          chatHeaderSubtitle.classList.add('hidden');
+          chatHeaderAvatar.classList.add('hidden');
+          composerEl.classList.add('hidden');
+          chatBodyEl.innerHTML = '<div class="empty-state">This user has been deleted by the admin.</div>';
+        }
+        loadUsers();
+        if (me && me.isAdmin) loadAdminData();
+      });
+
+      socket.on('account-blocked', (data) => {
+        alert(data.reason || 'Your account has been blocked by the admin.');
+        window.location.href = '/login.html';
+      });
+
+      socket.on('account-deleted', () => {
+        alert('Your account has been deleted by the admin.');
+        window.location.href = '/login.html';
+      });
+
+      socket.on('admin-user-updated', () => {
+        if (me && me.isAdmin) loadAdminData();
+      });
+
+      socket.on('error-message', (e) => {
+        alert(e.error || 'Something went wrong');
+      });
+    } catch (err) {
+      console.warn('Socket connection error or fallback:', err);
     }
-  });
+  }
 
-  socket.on('file-shared', (file) => {
-    if (activeUser && (file.from === activeUser || file.to === activeUser)) {
-      renderFile(file);
-      scrollToBottom();
-    }
-  });
-
-  socket.on('avatar-updated', ({ username, avatarUrl }) => {
-    userAvatars.set(username, avatarUrl);
-    if (me && username === me.username) {
-      me.avatarUrl = avatarUrl;
-      myAvatarImg.src = avatarUrl;
-    }
-    // Update sidebar list avatar
-    const contactImg = document.querySelector(`.user-item[data-username="${username}"] .avatar-img`);
-    if (contactImg) contactImg.src = avatarUrl;
-
-    // Update active chat header avatar
-    if (activeUser === username && chatHeaderAvatar) {
-      chatHeaderAvatar.src = avatarUrl;
-    }
-
-    // Update timeline avatars for this user
-    document.querySelectorAll(`.msg-avatar[data-username="${username}"]`).forEach(img => {
-      img.src = avatarUrl;
-    });
-
-    if (me && me.isAdmin) {
-      loadAdminUsers();
-    }
-  });
-
-  socket.on('new-user', ({ username, avatarUrl }) => {
-    userAvatars.set(username, avatarUrl);
-    loadUsers();
-    if (me && me.isAdmin) loadAdminData();
-  });
-
-  socket.on('user-deleted', ({ username }) => {
-    userAvatars.delete(username);
-    if (activeUser === username) {
-      activeUser = null;
-      chatHeaderTitle.textContent = 'Select a user to start chatting';
-      chatHeaderSubtitle.classList.add('hidden');
-      chatHeaderAvatar.classList.add('hidden');
-      composerEl.classList.add('hidden');
-      chatBodyEl.innerHTML = '<div class="empty-state">This user has been deleted by the admin.</div>';
-    }
-    loadUsers();
-    if (me && me.isAdmin) loadAdminData();
-  });
-
-  socket.on('account-blocked', (data) => {
-    alert(data.reason || 'Your account has been blocked by the admin.');
-    window.location.href = '/login.html';
-  });
-
-  socket.on('account-deleted', () => {
-    alert('Your account has been deleted by the admin.');
-    window.location.href = '/login.html';
-  });
-
-  socket.on('admin-user-updated', () => {
-    if (me && me.isAdmin) loadAdminData();
-  });
-
-  socket.on('error-message', (e) => {
-    alert(e.error || 'Something went wrong');
-  });
-
+  // Always load users regardless of socket connection
   await loadUsers();
+
+  // Background polling to discover newly registered users
+  setInterval(loadUsers, 4000);
+
+  // Background polling for admin stats if admin view is open
+  setInterval(() => {
+    if (me && me.isAdmin && adminView && !adminView.classList.contains('hidden')) {
+      loadAdminData();
+    }
+  }, 5000);
 }
 
 // ---------- EMOJI PICKER SYSTEM ----------
@@ -371,33 +395,87 @@ async function selectUser(username) {
   composerEl.classList.remove('hidden');
   chatBodyEl.innerHTML = '<div class="empty-state">Loading conversation…</div>';
 
-  const [msgsRes, filesRes] = await Promise.all([
-    fetch(`/api/messages/${encodeURIComponent(username)}`),
-    fetch('/api/files')
-  ]);
-  const msgsData = await msgsRes.json();
-  const filesData = await filesRes.json();
+  renderedMessageIds.clear();
+  renderedFileIds.clear();
+  if (chatPollInterval) clearInterval(chatPollInterval);
 
-  const relevantFiles = filesData.files.filter(f => f.from === username || f.to === username);
+  try {
+    const [msgsRes, filesRes] = await Promise.all([
+      fetch(`/api/messages/${encodeURIComponent(username)}`),
+      fetch('/api/files')
+    ]);
+    const msgsData = await msgsRes.json();
+    const filesData = await filesRes.json();
 
-  const timeline = [
-    ...msgsData.messages.map(m => ({ type: 'message', ts: m.timestamp, data: m })),
-    ...relevantFiles.map(f => ({ type: 'file', ts: f.uploadedAt, data: f }))
-  ].sort((a, b) => a.ts - b.ts);
+    const relevantFiles = (filesData.files || []).filter(f => f.from === username || f.to === username);
 
-  chatBodyEl.innerHTML = '';
-  if (!timeline.length) {
-    chatBodyEl.innerHTML = `<div class="empty-state">No messages yet. Say hi to ${escapeHtml(username)}! 👋</div>`;
-  } else {
-    timeline.forEach(item => {
-      if (item.type === 'message') renderMessage(item.data);
-      else renderFile(item.data);
-    });
+    const timeline = [
+      ...(msgsData.messages || []).map(m => ({ type: 'message', ts: m.timestamp, data: m })),
+      ...relevantFiles.map(f => ({ type: 'file', ts: f.uploadedAt, data: f }))
+    ].sort((a, b) => a.ts - b.ts);
+
+    chatBodyEl.innerHTML = '';
+    if (!timeline.length) {
+      chatBodyEl.innerHTML = `<div class="empty-state">No messages yet. Say hi to ${escapeHtml(username)}! 👋</div>`;
+    } else {
+      timeline.forEach(item => {
+        if (item.type === 'message') renderMessage(item.data);
+        else renderFile(item.data);
+      });
+    }
+    scrollToBottom();
+  } catch (err) {
+    console.error('Error loading thread:', err);
+    chatBodyEl.innerHTML = `<div class="empty-state">Start a conversation with ${escapeHtml(username)}! 👋</div>`;
   }
-  scrollToBottom();
+
+  // Background polling for active conversation (vital for Vercel / serverless deployments)
+  chatPollInterval = setInterval(async () => {
+    if (!activeUser || activeUser !== username) return;
+    try {
+      const [pMsgsRes, pFilesRes] = await Promise.all([
+        fetch(`/api/messages/${encodeURIComponent(username)}`),
+        fetch('/api/files')
+      ]);
+      if (!pMsgsRes.ok) return;
+      const pMsgsData = await pMsgsRes.json();
+      const pFilesData = await pFilesRes.json();
+
+      let hasNew = false;
+      if (pMsgsData.messages && pMsgsData.messages.length) {
+        pMsgsData.messages.forEach(m => {
+          if (!renderedMessageIds.has(m.id)) {
+            const emptyEl = chatBodyEl.querySelector('.empty-state');
+            if (emptyEl) chatBodyEl.innerHTML = '';
+            renderMessage(m);
+            hasNew = true;
+          }
+        });
+      }
+      if (pFilesData.files && pFilesData.files.length) {
+        const relevantFiles = pFilesData.files.filter(f => f.from === username || f.to === username);
+        relevantFiles.forEach(f => {
+          if (!renderedFileIds.has(f.id)) {
+            const emptyEl = chatBodyEl.querySelector('.empty-state');
+            if (emptyEl) chatBodyEl.innerHTML = '';
+            renderFile(f);
+            hasNew = true;
+          }
+        });
+      }
+      if (hasNew) scrollToBottom();
+    } catch (e) {}
+  }, 2500);
 }
 
 function renderMessage(msg) {
+  if (!msg || !msg.id) return;
+  if (renderedMessageIds.has(msg.id)) return;
+  renderedMessageIds.add(msg.id);
+
+  const emptyEl = chatBodyEl.querySelector('.empty-state');
+  if (emptyEl) emptyEl.remove();
+
   const mine = msg.from === me.username;
   const avatarUrl = msg.avatarUrl || getAvatar(msg.from);
 
@@ -430,6 +508,13 @@ function renderMessage(msg) {
 }
 
 function renderFile(file) {
+  if (!file || !file.id) return;
+  if (renderedFileIds.has(file.id)) return;
+  renderedFileIds.add(file.id);
+
+  const emptyEl = chatBodyEl.querySelector('.empty-state');
+  if (emptyEl) emptyEl.remove();
+
   const mine = file.from === me.username;
   const avatarUrl = getAvatar(file.from);
 
@@ -502,49 +587,31 @@ async function sendMessage() {
   emojiPicker.classList.add('hidden');
   emojiToggleBtn.classList.remove('active');
 
+  // Emit via socket if connected
   if (socket && socket.connected) {
     socket.emit('private-message', { to: targetUser, text });
-  } else {
-    // HTTP fallback for serverless deployments (Vercel)
-    try {
-      const res = await fetch('/api/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: targetUser, text })
-      });
-      const data = await res.json();
-      if (res.ok && data.message) {
-        if (activeUser === targetUser) {
-          renderMessage(data.message);
-          scrollToBottom();
-        }
-      } else if (data && data.error) {
-        alert(data.error);
+  }
+
+  // Also send via HTTP (ensures delivery on serverless like Vercel)
+  try {
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: targetUser, text })
+    });
+    const data = await res.json();
+    if (res.ok && data.message) {
+      if (activeUser === targetUser && !renderedMessageIds.has(data.message.id)) {
+        renderMessage(data.message);
+        scrollToBottom();
       }
-    } catch (e) {
-      console.error('Failed to send message via HTTP:', e);
+    } else if (data && data.error) {
+      alert(data.error);
     }
+  } catch (e) {
+    console.error('Failed to send message via HTTP:', e);
   }
 }
-
-// Serverless / Vercel auto-sync: Poll conversation when socket is disconnected
-setInterval(async () => {
-  if (!activeUser) return;
-  if (!socket || !socket.connected) {
-    try {
-      const res = await fetch(`/api/messages/${encodeURIComponent(activeUser)}`);
-      if (res.ok) {
-        const data = await res.json();
-        const currentMsgs = chatBodyEl.querySelectorAll('.msg-row');
-        if (data.messages && data.messages.length > currentMsgs.length) {
-          const newMsgs = data.messages.slice(currentMsgs.length);
-          newMsgs.forEach(m => renderMessage(m));
-          scrollToBottom();
-        }
-      }
-    } catch (e) {}
-  }
-}, 3000);
 
 attachBtn.addEventListener('click', () => {
   if (!activeUser) return alert('Select a user first');
