@@ -9,6 +9,7 @@
 const path = require('path');
 const fs = require('fs');
 const mongoose = require('mongoose');
+const githubSync = require('./githubSync');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const IS_VERCEL = !!process.env.VERCEL;
@@ -126,7 +127,17 @@ async function getUser(username) {
   if (isUsingMongo()) {
     return await UserModel.findOne({ username }).lean();
   }
-  const users = readJSON(USERS_FILE, {});
+  let users = readJSON(USERS_FILE, {});
+  if (!users[username]) {
+    // Check if new user was registered and committed to GitHub
+    try {
+      const gh = await githubSync.fetchUsersFromGithub();
+      if (gh && gh.users && gh.users[username]) {
+        users[username] = gh.users[username];
+        writeJSON(USERS_FILE, users);
+      }
+    } catch (e) {}
+  }
   return users[username] ? { username, ...users[username] } : null;
 }
 
@@ -136,8 +147,19 @@ async function findUserCaseInsensitive(username) {
     const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return await UserModel.findOne({ username: new RegExp(`^${escaped}$`, 'i') }).lean();
   }
-  const users = readJSON(USERS_FILE, {});
-  const match = Object.keys(users).find(u => u.toLowerCase() === username.toLowerCase());
+  let users = readJSON(USERS_FILE, {});
+  let match = Object.keys(users).find(u => u.toLowerCase() === username.toLowerCase());
+  if (!match) {
+    // Check if new user exists in GitHub repository
+    try {
+      const gh = await githubSync.fetchUsersFromGithub();
+      if (gh && gh.users) {
+        users = { ...users, ...gh.users };
+        writeJSON(USERS_FILE, users);
+        match = Object.keys(users).find(u => u.toLowerCase() === username.toLowerCase());
+      }
+    } catch (e) {}
+  }
   return match ? { username: match, ...users[match] } : null;
 }
 
@@ -171,16 +193,31 @@ async function saveUser(username, data) {
       { $set: { username, ...data } },
       { upsert: true, returnDocument: 'after' }
     ).lean();
+    // Also sync to GitHub repository if GITHUB_TOKEN is present
+    try {
+      await githubSync.syncUserToGithub(username, data);
+    } catch (e) {}
     return doc;
   }
   const users = readJSON(USERS_FILE, {});
   users[username] = { ...(users[username] || {}), ...data };
   writeJSON(USERS_FILE, users);
+
+  // Automatically update data/users.json in GitHub repository
+  try {
+    await githubSync.syncUserToGithub(username, users[username]);
+  } catch (e) {
+    console.error('[db] Error syncing user to GitHub:', e.message);
+  }
+
   return { username, ...users[username] };
 }
 
 async function deleteUser(username) {
   await connectDB();
+  try {
+    await githubSync.syncDeleteUserFromGithub(username);
+  } catch (e) {}
   if (isUsingMongo()) {
     await UserModel.deleteOne({ username });
     return true;
@@ -305,6 +342,18 @@ async function seedAndSync({ adminUsername, adminPasswordHash, seedPath }) {
       localUsers = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
     } catch (e) {}
   }
+
+  // Also pull latest users from GitHub repository (critical for Vercel cold starts)
+  try {
+    const gh = await githubSync.fetchUsersFromGithub();
+    if (gh && gh.users) {
+      for (const [uname, udata] of Object.entries(gh.users)) {
+        if (!localUsers[uname]) {
+          localUsers[uname] = udata;
+        }
+      }
+    }
+  } catch (e) {}
 
   if (isUsingMongo()) {
     // 1. Ensure Admin User in MongoDB

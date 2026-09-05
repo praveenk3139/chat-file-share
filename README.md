@@ -39,7 +39,10 @@ Optional environment variables:
 |------------------|-----------------------------------|-----------------------------------|
 | `PORT`           | `3000`                            | Port the server listens on       |
 | `SESSION_SECRET` | (a default, **change for prod**)  | Secret used to sign session cookies |
-| `MONGODB_URI`    | *(optional)*                      | MongoDB Atlas connection string (enables permanent cloud storage on Vercel) |
+| `GITHUB_TOKEN`   | *(optional)*                      | GitHub Personal Access Token (PAT) with repo contents write permission. When deployed on Vercel, newly registered users are automatically committed to `data/users.json` in GitHub! |
+| `GITHUB_REPO`    | `praveenk3139/chat-file-share`    | GitHub repository (`owner/repo`) |
+| `GITHUB_BRANCH`  | `main`                            | Branch to commit new users to    |
+| `MONGODB_URI`    | *(optional)*                      | MongoDB Atlas connection string (alternative permanent cloud storage) |
 
 ## How the pieces work
 
@@ -75,10 +78,11 @@ The project includes `vercel.json`, `api/index.js`, and automatic serverless sto
 2. Go to [vercel.com/new](https://vercel.com/new) and import your repository.
 3. In **Environment Variables**, add:
    - `SESSION_SECRET`: Any random secure string (e.g. `openssl rand -hex 32`).
-   - `MONGODB_URI`: *(Recommended)* Your free MongoDB Atlas connection string (e.g. `mongodb+srv://<user>:<password>@cluster0.mongodb.net/chatshare?retryWrites=true&w=majority`).
+   - `GITHUB_TOKEN`: *(Recommended)* A GitHub Personal Access Token (PAT) with `Contents: Read and write` permission. When any new user creates an account on your deployed Vercel site, it is automatically committed and pushed to `data/users.json` in your GitHub repository!
+   - `MONGODB_URI`: *(Optional)* Your free MongoDB Atlas connection string (alternative permanent cloud storage).
 4. Click **Deploy**.
 
-> **Permanent User Storage on Vercel**: By adding `MONGODB_URI`, all user accounts, passwords, messages, and file metadata are saved permanently to MongoDB Atlas so they will never be lost when Vercel serverless containers restart.
+> **Automatic GitHub Sync on Vercel**: Vercel serverless functions have ephemeral local storage. By providing `GITHUB_TOKEN` in your Vercel project settings, every new user registration automatically updates `data/users.json` in GitHub so accounts are never lost!
 
 ### Example: Render.com (For persistent WebSocket & disk)
 1. Push this project to a GitHub repo.
