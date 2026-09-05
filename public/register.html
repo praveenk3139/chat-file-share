@@ -24,10 +24,13 @@
       <div id="msg"></div>
       <form id="registerForm">
         <label for="username">Username</label>
-        <input type="text" id="username" placeholder="e.g. john_doe" autocomplete="username" required>
+        <input type="text" id="username" placeholder="e.g. john_doe" autocomplete="username" required autofocus>
+        <div class="form-hint" style="font-size:11px;color:var(--muted);margin:-8px 0 14px 2px;">3–20 characters (letters, numbers, _ - .)</div>
+
         <label for="password">Password</label>
-        <input type="password" id="password" placeholder="At least 6 characters" autocomplete="new-password" required>
-        <button type="submit" class="btn-primary">Create Account ✨</button>
+        <input type="password" id="password" placeholder="At least 6 characters" autocomplete="new-password" required minlength="6">
+        
+        <button type="submit" class="btn-primary" id="submitBtn">Create Account ✨</button>
       </form>
       <div class="switch-link">
         Already have an account? <a href="/login.html">Log in</a>
@@ -38,12 +41,14 @@
   <script>
     const form = document.getElementById('registerForm');
     const usernameInput = document.getElementById('username');
+    const passwordInput = document.getElementById('password');
+    const submitBtn = document.getElementById('submitBtn');
     const previewAvatar = document.getElementById('previewAvatar');
     const previewUsername = document.getElementById('previewUsername');
     const msgEl = document.getElementById('msg');
 
     usernameInput.addEventListener('input', () => {
-      const val = usernameInput.value.trim();
+      const val = usernameInput.value.trim().toLowerCase().replace(/\s+/g, '_');
       const display = val || 'user';
       previewUsername.textContent = '@' + display;
       previewAvatar.src = `/api/avatar/${encodeURIComponent(display)}`;
@@ -55,8 +60,19 @@
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const username = usernameInput.value.trim();
-      const password = document.getElementById('password').value;
+      const username = usernameInput.value.trim().toLowerCase().replace(/\s+/g, '_');
+      const password = passwordInput.value;
+
+      if (!username) {
+        return showMsg('Please enter a username', 'error');
+      }
+      if (password.length < 6) {
+        return showMsg('Password must be at least 6 characters long', 'error');
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Creating Account…';
+
       try {
         const res = await fetch('/api/register', {
           method: 'POST',
@@ -64,11 +80,20 @@
           body: JSON.stringify({ username, password })
         });
         const data = await res.json();
-        if (!res.ok) return showMsg(data.error || 'Registration failed', 'error');
-        showMsg('Account created! Redirecting to login…', 'success');
-        setTimeout(() => window.location.href = '/login.html', 1200);
+        if (!res.ok) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Create Account ✨';
+          return showMsg(data.error || 'Registration failed. Please try another username.', 'error');
+        }
+
+        showMsg('Account created! Launching your chat space… 🚀', 'success');
+        setTimeout(() => {
+          window.location.href = data.redirect || '/dashboard.html';
+        }, 600);
       } catch (err) {
-        showMsg('Network error. Please try again.', 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create Account ✨';
+        showMsg('Network error. Please check your connection and try again.', 'error');
       }
     });
   </script>

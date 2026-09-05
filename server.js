@@ -213,9 +213,9 @@ app.post('/api/register', async (req, res) => {
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
     }
-    username = String(username).trim();
-    if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(username)) {
-      return res.status(400).json({ error: 'Username must be 3-20 chars: letters, numbers, _ . -' });
+    username = String(username).trim().toLowerCase().replace(/\s+/g, '_');
+    if (!/^[a-z0-9_.-]{3,20}$/.test(username)) {
+      return res.status(400).json({ error: 'Username must be 3-20 characters: letters, numbers, _ . -' });
     }
     if (String(password).length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
@@ -223,7 +223,7 @@ app.post('/api/register', async (req, res) => {
 
     const exists = await db.findUserCaseInsensitive(username);
     if (exists) {
-      return res.status(409).json({ error: 'That username is already taken' });
+      return res.status(409).json({ error: `Username "${username}" is already taken` });
     }
 
     const passwordHash = bcrypt.hashSync(password, 10);
@@ -235,9 +235,31 @@ app.post('/api/register', async (req, res) => {
     });
 
     const initialAvatarUrl = getUserAvatarUrl(newUser, username);
-    io.emit('new-user', { username, avatarUrl: initialAvatarUrl });
+    try { io.emit('new-user', { username, avatarUrl: initialAvatarUrl }); } catch (e) {}
 
-    res.json({ ok: true, message: 'Account created. You can now log in.' });
+    // Auto-login upon registration
+    req.session.username = username;
+    req.session.isAdmin = false;
+    const token = nanoid();
+    socketTokens.set(token, username);
+    req.session.socketToken = token;
+
+    const authToken = signToken({ username, isAdmin: false });
+    res.cookie('auth_token', authToken, {
+      httpOnly: true,
+      maxAge: 1000 * 60 * 60 * 24 * 7,
+      sameSite: 'lax'
+    });
+
+    res.json({
+      ok: true,
+      message: 'Account created! Launching your chat space…',
+      username,
+      isAdmin: false,
+      socketToken: token,
+      avatarUrl: initialAvatarUrl,
+      redirect: '/dashboard.html'
+    });
   } catch (err) {
     console.error('Registration error:', err);
     res.status(500).json({ error: 'Failed to create account. Please try again.' });
@@ -304,7 +326,8 @@ app.get('/api/me', requireAuth, async (req, res) => {
     username: user.username,
     isAdmin: !!user.isAdmin,
     socketToken: (req.session && req.session.socketToken) || nanoid(),
-    avatarUrl
+    avatarUrl,
+    isServerless: IS_VERCEL
   });
 });
 
@@ -322,6 +345,77 @@ app.get('/api/users', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Error fetching users:', err);
     res.status(500).json({ error: 'Failed to fetch user list' });
+  }
+});
+
+// ---------- HIGH-SPEED REAL-TIME SYNC (OPTIMIZED FOR VERCEL & SERVERLESS) ----------
+
+app.get('/api/sync', requireAuth, async (req, res) => {
+  try {
+    const me = req.user.username;
+    const since = parseInt(req.query.since, 10) || 0;
+    const clientUsersCount = parseInt(req.query.usersCount, 10);
+
+    const [allMessages, allFiles, allUsersList, usersMap] = await Promise.all([
+      db.getAllMessages(),
+      db.getAllFiles(),
+      db.getAllUsersList(),
+      db.getAllUsersMap()
+    ]);
+
+    // 1. Delta messages for me
+    const newMessages = allMessages.filter(m => {
+      const involvesMe = (m.from === me || m.to === me);
+      return involvesMe && m.timestamp > since;
+    }).map(m => ({
+      ...m,
+      avatarUrl: m.avatarUrl || getUserAvatarUrl(usersMap[m.from], m.from)
+    }));
+
+    // 2. Delta files for me
+    const newFiles = allFiles.filter(f => {
+      const involvesMe = (f.from === me || f.to === me);
+      return involvesMe && f.uploadedAt > since;
+    });
+
+    // 3. User updates
+    const activeUsers = allUsersList.filter(u => u.username !== me && !u.isBlocked);
+    let usersUpdate = null;
+    if (isNaN(clientUsersCount) || clientUsersCount !== activeUsers.length || req.query.forceUsers === 'true') {
+      usersUpdate = activeUsers.map(u => ({
+        username: u.username,
+        avatarUrl: getUserAvatarUrl(u, u.username)
+      }));
+    }
+
+    // 4. Summaries for conversations (last message snippet, sender, timestamp)
+    const threadSummaries = {};
+    allMessages.forEach(m => {
+      const other = m.from === me ? m.to : (m.to === me ? m.from : null);
+      if (other) {
+        if (!threadSummaries[other] || m.timestamp > threadSummaries[other].timestamp) {
+          threadSummaries[other] = {
+            id: m.id,
+            from: m.from,
+            text: m.text,
+            timestamp: m.timestamp
+          };
+        }
+      }
+    });
+
+    res.json({
+      ok: true,
+      serverTime: Date.now(),
+      isBlocked: !!req.user.isBlocked,
+      newMessages,
+      newFiles,
+      users: usersUpdate,
+      threads: threadSummaries
+    });
+  } catch (err) {
+    console.error('Real-time sync error:', err);
+    res.status(500).json({ error: 'Sync failed' });
   }
 });
 
@@ -594,6 +688,48 @@ app.post('/api/admin/users/:username/unblock', requireAdmin, async (req, res) =>
   res.json({ ok: true, message: `User "${target}" has been unblocked.` });
 });
 
+// 4b. Admin Create user
+app.post('/api/admin/users/create', requireAdmin, async (req, res) => {
+  try {
+    let { username, password, isAdmin } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+    username = String(username).trim().toLowerCase().replace(/\s+/g, '_');
+    if (!/^[a-z0-9_.-]{3,20}$/.test(username)) {
+      return res.status(400).json({ error: 'Username must be 3-20 characters: letters, numbers, _, -, .' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const exists = await db.findUserCaseInsensitive(username);
+    if (exists) {
+      return res.status(409).json({ error: `Username "${username}" already exists` });
+    }
+
+    const passwordHash = bcrypt.hashSync(password, 10);
+    const newUser = await db.saveUser(username, {
+      passwordHash,
+      createdAt: Date.now(),
+      isAdmin: !!isAdmin,
+      isBlocked: false
+    });
+
+    const avatarUrl = getUserAvatarUrl(newUser, username);
+    try { io.emit('new-user', { username, avatarUrl }); } catch (e) {}
+
+    res.json({
+      ok: true,
+      message: `User "${username}" created successfully`,
+      user: { username, isAdmin: !!isAdmin, avatarUrl }
+    });
+  } catch (err) {
+    console.error('Admin create user error:', err);
+    res.status(500).json({ error: 'Failed to create user account' });
+  }
+});
+
 // 5. Delete user
 app.delete('/api/admin/users/:username', requireAdmin, async (req, res) => {
   const target = req.params.username;
@@ -715,6 +851,11 @@ app.delete('/api/admin/files/:id', requireAdmin, async (req, res) => {
   }
   await db.deleteFile(req.params.id);
   res.json({ ok: true });
+});
+
+// Graceful fallback for socket.io requests in serverless environments
+app.all('/socket.io*', (req, res) => {
+  res.status(200).json({ ok: false, message: 'Serverless real-time sync active' });
 });
 
 // ---------- fallback routes for pages ----------

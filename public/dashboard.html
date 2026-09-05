@@ -127,8 +127,11 @@
           <!-- Section: User Moderation -->
           <div class="admin-section">
             <div class="admin-section-header">
-              <h3>User Management & Moderation</h3>
-              <span class="admin-section-hint">Block or delete accounts instantly</span>
+              <div>
+                <h3>User Management & Moderation</h3>
+                <span class="admin-section-hint">Block, delete, or create accounts instantly</span>
+              </div>
+              <button class="btn-primary" id="openCreateUserModalBtn" style="padding:7px 14px;font-size:12px;display:inline-flex;align-items:center;gap:6px;">➕ Add User</button>
             </div>
 
             <div class="admin-table-wrap">
@@ -200,6 +203,36 @@
       <div class="modal-footer">
         <button class="btn-secondary" id="cancelAvatarBtn">Cancel</button>
         <button class="btn-primary" id="saveAvatarBtn">Save Picture</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Create User Modal -->
+  <div class="modal-backdrop hidden" id="createUserModal">
+    <div class="modal-card" style="max-width:380px;">
+      <div class="modal-header">
+        <h3>Create New User</h3>
+        <button class="close-btn" id="closeCreateUserModalBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="adminCreateUserMsg" class="msg hidden"></div>
+        <form id="adminCreateUserForm">
+          <label for="adminNewUsername">Username</label>
+          <input type="text" id="adminNewUsername" placeholder="e.g. alex or sarah" required autocomplete="off">
+          <div style="font-size:11px;color:var(--muted);margin:-8px 0 14px 2px;">3–20 chars (letters, numbers, _ - .)</div>
+
+          <label for="adminNewPassword">Password</label>
+          <input type="password" id="adminNewPassword" placeholder="At least 6 characters" required autocomplete="new-password">
+
+          <div style="margin-top:14px;display:flex;align-items:center;gap:8px;">
+            <input type="checkbox" id="adminNewIsAdmin" style="width:auto;margin:0;">
+            <label for="adminNewIsAdmin" style="margin:0;font-size:13px;cursor:pointer;">Grant Admin Privileges</label>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" id="cancelCreateUserBtn">Cancel</button>
+        <button class="btn-primary" id="submitCreateUserBtn">Create User ✨</button>
       </div>
     </div>
   </div>

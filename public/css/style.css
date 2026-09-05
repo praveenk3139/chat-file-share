@@ -518,6 +518,36 @@ button {
   text-overflow: ellipsis;
 }
 
+.user-item-preview {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.user-item.active .user-item-preview {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.user-item-unread-badge {
+  background: var(--accent);
+  color: white;
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 999px;
+  margin-left: auto;
+  box-shadow: 0 0 10px var(--accent-glow);
+  flex-shrink: 0;
+  animation: pulseGlow 2s infinite ease-in-out;
+}
+
+@keyframes pulseGlow {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.08); opacity: 0.85; }
+}
+
 /* ---- Main View Panels ---- */
 .main {
   position: relative;

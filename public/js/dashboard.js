@@ -5,7 +5,12 @@ const userAvatars = new Map();
 const messageReactions = new Map(); // msgId -> { [emoji]: count }
 const renderedMessageIds = new Set();
 const renderedFileIds = new Set();
-let chatPollInterval = null;
+const unreadCounts = new Map(); // username -> count
+const threadSnippets = new Map(); // username -> { text, timestamp, from }
+let cachedUsers = [];
+let lastSyncTimestamp = 0;
+let isSyncInProgress = false;
+let syncTimer = null;
 
 // General UI elements
 const userListEl = document.getElementById('userList');
@@ -63,7 +68,7 @@ let selectedAvatarFile = null;
 let activeInspectorPair = null;
 let currentEmojiCategory = 'smileys';
 
-// Categorized Emojis with Search Keywords
+// Categorized Emojis
 const EMOJI_CATEGORIES = {
   smileys: {
     title: 'Smileys & Emotions',
@@ -101,6 +106,8 @@ function getAvatar(username) {
   return userAvatars.get(username) || `/api/avatar/${encodeURIComponent(username)}`;
 }
 
+// ---------- APP INITIALIZATION ----------
+
 async function init() {
   const res = await fetch('/api/me');
   if (!res.ok) {
@@ -119,17 +126,14 @@ async function init() {
   }
 
   setupEmojiPicker();
-  localStorage.removeItem('chatshare_theme');
-  localStorage.removeItem('chatshare_bg_image');
-  localStorage.removeItem('chatshare_bg_opacity');
-  document.body.removeAttribute('data-theme');
 
-  if (typeof io !== 'undefined') {
+  // Socket.IO only when NOT in serverless mode (avoids 404 spam on Vercel)
+  if (!me.isServerless && typeof io !== 'undefined') {
     try {
       socket = io({
         auth: { token: me.socketToken },
-        reconnectionAttempts: 5,
-        timeout: 5000,
+        reconnectionAttempts: 3,
+        timeout: 4000,
         transports: ['websocket', 'polling']
       });
 
@@ -151,35 +155,9 @@ async function init() {
         }
       });
 
-      socket.on('avatar-updated', ({ username, avatarUrl }) => {
-        userAvatars.set(username, avatarUrl);
-        if (me && username === me.username) {
-          me.avatarUrl = avatarUrl;
-          myAvatarImg.src = avatarUrl;
-        }
-        // Update sidebar list avatar
-        const contactImg = document.querySelector(`.user-item[data-username="${username}"] .avatar-img`);
-        if (contactImg) contactImg.src = avatarUrl;
-
-        // Update active chat header avatar
-        if (activeUser === username && chatHeaderAvatar) {
-          chatHeaderAvatar.src = avatarUrl;
-        }
-
-        // Update timeline avatars for this user
-        document.querySelectorAll(`.msg-avatar[data-username="${username}"]`).forEach(img => {
-          img.src = avatarUrl;
-        });
-
-        if (me && me.isAdmin) {
-          loadAdminUsers();
-        }
-      });
-
       socket.on('new-user', ({ username, avatarUrl }) => {
         userAvatars.set(username, avatarUrl);
-        loadUsers();
-        if (me && me.isAdmin) loadAdminData();
+        syncNow(true);
       });
 
       socket.on('user-deleted', ({ username }) => {
@@ -192,44 +170,146 @@ async function init() {
           composerEl.classList.add('hidden');
           chatBodyEl.innerHTML = '<div class="empty-state">This user has been deleted by the admin.</div>';
         }
-        loadUsers();
-        if (me && me.isAdmin) loadAdminData();
+        syncNow(true);
       });
 
       socket.on('account-blocked', (data) => {
         alert(data.reason || 'Your account has been blocked by the admin.');
         window.location.href = '/login.html';
       });
-
-      socket.on('account-deleted', () => {
-        alert('Your account has been deleted by the admin.');
-        window.location.href = '/login.html';
-      });
-
-      socket.on('admin-user-updated', () => {
-        if (me && me.isAdmin) loadAdminData();
-      });
-
-      socket.on('error-message', (e) => {
-        alert(e.error || 'Something went wrong');
-      });
     } catch (err) {
-      console.warn('Socket connection error or fallback:', err);
+      console.warn('Socket connection fallback active.');
     }
   }
 
-  // Always load users regardless of socket connection
+  // Load initial users
   await loadUsers();
 
-  // Background polling to discover newly registered users
-  setInterval(loadUsers, 4000);
+  // Start real-time synchronization engine (vital for Vercel)
+  startRealtimeSync();
+}
 
-  // Background polling for admin stats if admin view is open
-  setInterval(() => {
-    if (me && me.isAdmin && adminView && !adminView.classList.contains('hidden')) {
-      loadAdminData();
+// ---------- HIGH-SPEED REAL-TIME ENGINE ----------
+
+function startRealtimeSync() {
+  if (syncTimer) clearInterval(syncTimer);
+
+  // High-frequency polling (1.2s for instantaneous real-time chat on Vercel)
+  syncTimer = setInterval(syncNow, 1200);
+
+  // Reactivate instantly when tab is focused
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      syncNow();
     }
-  }, 5000);
+  });
+  window.addEventListener('focus', () => syncNow());
+}
+
+async function syncNow(forceUsers = false) {
+  if (isSyncInProgress) return;
+  isSyncInProgress = true;
+
+  try {
+    const params = new URLSearchParams({
+      since: String(lastSyncTimestamp || 0),
+      usersCount: String(cachedUsers.length),
+      activeUser: activeUser || '',
+      forceUsers: forceUsers ? 'true' : 'false'
+    });
+
+    const res = await fetch(`/api/sync?${params.toString()}`);
+    if (res.status === 401) {
+      window.location.href = '/login.html';
+      return;
+    }
+    if (!res.ok) return;
+
+    const data = await res.json();
+    if (data.isBlocked) {
+      alert('Your account has been blocked by the admin.');
+      window.location.href = '/login.html';
+      return;
+    }
+
+    if (data.serverTime) {
+      // Advance watermark slightly behind server time to prevent dropped messages
+      lastSyncTimestamp = Math.max(lastSyncTimestamp, data.serverTime - 2500);
+    }
+
+    // 1. Update threads map
+    if (data.threads) {
+      Object.entries(data.threads).forEach(([u, t]) => {
+        threadSnippets.set(u, t);
+      });
+    }
+
+    // 2. Update users list if count changed or force updated
+    if (data.users && Array.isArray(data.users)) {
+      cachedUsers = data.users;
+      cachedUsers.forEach(u => {
+        userAvatars.set(u.username, u.avatarUrl);
+      });
+      renderUserList();
+    }
+
+    // 3. Process new messages in real time!
+    let activeChatReceivedNew = false;
+    if (data.newMessages && data.newMessages.length) {
+      data.newMessages.forEach(msg => {
+        if (!renderedMessageIds.has(msg.id)) {
+          lastSyncTimestamp = Math.max(lastSyncTimestamp, msg.timestamp);
+
+          const isForActive = activeUser && (msg.from === activeUser || (msg.from === me.username && msg.to === activeUser));
+          if (isForActive) {
+            renderMessage(msg);
+            activeChatReceivedNew = true;
+          } else {
+            // Message from another contact -> increment unread badge!
+            const other = msg.from === me.username ? msg.to : msg.from;
+            const current = unreadCounts.get(other) || 0;
+            unreadCounts.set(other, current + 1);
+            updateUserBadge(other);
+          }
+
+          // Update snippet
+          const contact = msg.from === me.username ? msg.to : msg.from;
+          threadSnippets.set(contact, {
+            text: msg.text,
+            timestamp: msg.timestamp,
+            from: msg.from
+          });
+          updateUserItemPreview(contact);
+        }
+      });
+    }
+
+    if (activeChatReceivedNew) {
+      scrollToBottom();
+    }
+
+    // 4. Process new files
+    if (data.newFiles && data.newFiles.length) {
+      let activeChatReceivedFile = false;
+      data.newFiles.forEach(file => {
+        if (!renderedFileIds.has(file.id)) {
+          lastSyncTimestamp = Math.max(lastSyncTimestamp, file.uploadedAt);
+          const isForActive = activeUser && (file.from === activeUser || (file.from === me.username && file.to === activeUser));
+          if (isForActive) {
+            renderFile(file);
+            activeChatReceivedFile = true;
+          }
+        }
+      });
+      if (activeChatReceivedFile) {
+        scrollToBottom();
+      }
+    }
+  } catch (e) {
+    // Network hiccup - ignore and retry next cycle
+  } finally {
+    isSyncInProgress = false;
+  }
 }
 
 // ---------- EMOJI PICKER SYSTEM ----------
@@ -237,7 +317,6 @@ async function init() {
 function setupEmojiPicker() {
   renderEmojiGrid(currentEmojiCategory);
 
-  // Toggle emoji picker
   emojiToggleBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     emojiPicker.classList.toggle('hidden');
@@ -247,7 +326,6 @@ function setupEmojiPicker() {
     }
   });
 
-  // Category Tab clicks
   emojiTabs.querySelectorAll('.emoji-tab-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -259,24 +337,19 @@ function setupEmojiPicker() {
     });
   });
 
-  // Search input filter
   emojiSearchInput.addEventListener('input', () => {
     const q = emojiSearchInput.value.trim().toLowerCase();
     if (!q) {
       renderEmojiGrid(currentEmojiCategory);
       return;
     }
-    // Search across all categories
     const results = [];
     Object.values(EMOJI_CATEGORIES).forEach(cat => {
-      cat.emojis.forEach(em => {
-        results.push(em);
-      });
+      cat.emojis.forEach(em => results.push(em));
     });
     renderCustomEmojiList('Search Results', results);
   });
 
-  // Close when clicking outside
   document.addEventListener('click', (e) => {
     if (!emojiPicker.contains(e.target) && e.target !== emojiToggleBtn) {
       emojiPicker.classList.add('hidden');
@@ -336,51 +409,105 @@ async function loadUsers() {
       return;
     }
     const data = await res.json();
-    if (data.error) {
-      userListEl.innerHTML = `<div class="empty-state" style="margin-top:20px; color:#fca5a5;">${escapeHtml(data.error)}</div>`;
-      return;
+    if (data.users && Array.isArray(data.users)) {
+      cachedUsers = data.users;
+      cachedUsers.forEach(u => userAvatars.set(u.username, u.avatarUrl));
+      renderUserList();
     }
-    if (!data.users || !data.users.length) {
-      userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px;">No other active users yet.<br><small style="opacity:0.75;display:block;margin-top:6px;">Sign up another account in incognito to start chatting!</small></div>';
-      return;
-    }
+  } catch (err) {
+    console.error('Failed to load users:', err);
+  }
+}
+
+function renderUserList() {
+  if (!cachedUsers || !cachedUsers.length) {
+    userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px;">No other active users yet.<br><small style="opacity:0.75;display:block;margin-top:6px;">Sign up another account to start chatting!</small></div>';
+    return;
+  }
+
+  // Sort: recent messages & unread first
+  const sorted = [...cachedUsers].sort((a, b) => {
+    const unreadA = unreadCounts.get(a.username) || 0;
+    const unreadB = unreadCounts.get(b.username) || 0;
+    if (unreadA !== unreadB) return unreadB - unreadA;
+    const timeA = (threadSnippets.get(a.username) && threadSnippets.get(a.username).timestamp) || 0;
+    const timeB = (threadSnippets.get(b.username) && threadSnippets.get(b.username).timestamp) || 0;
+    return timeB - timeA;
+  });
+
   userListEl.innerHTML = '';
-  data.users.forEach(item => {
-    const u = typeof item === 'string' ? item : item.username;
-    const avatarUrl = (typeof item === 'object' && item.avatarUrl) ? item.avatarUrl : `/api/avatar/${encodeURIComponent(u)}`;
+  sorted.forEach(item => {
+    const u = item.username;
+    const avatarUrl = item.avatarUrl || getAvatar(u);
     userAvatars.set(u, avatarUrl);
 
     const el = document.createElement('div');
     el.className = `user-item ${activeUser === u ? 'active' : ''}`;
     el.dataset.username = u;
+
+    const unread = unreadCounts.get(u) || 0;
+    const snippet = threadSnippets.get(u);
+    let previewText = 'Tap to chat';
+    if (snippet && snippet.text) {
+      previewText = snippet.from === me.username ? `You: ${snippet.text}` : snippet.text;
+    }
+
     el.innerHTML = `
       <div class="user-avatar-wrap">
         <img class="avatar-img" src="${avatarUrl}" alt="${escapeHtml(u)}">
       </div>
       <div class="user-item-info">
         <span class="user-item-name">${escapeHtml(u)}</span>
+        <span class="user-item-preview">${escapeHtml(previewText)}</span>
       </div>
+      <span class="user-item-unread-badge ${unread > 0 ? '' : 'hidden'}">${unread}</span>
     `;
+
     el.addEventListener('click', () => {
       switchView('chat');
       selectUser(u);
     });
+
     userListEl.appendChild(el);
   });
 
-  // Auto-select first contact if none is currently selected
-  if (!activeUser && data.users.length > 0) {
-    const firstUser = typeof data.users[0] === 'string' ? data.users[0] : data.users[0].username;
-    selectUser(firstUser);
+  // Auto-select first contact if none currently selected
+  if (!activeUser && sorted.length > 0) {
+    selectUser(sorted[0].username);
   }
-  } catch (err) {
-    console.error('Failed to load users:', err);
-    userListEl.innerHTML = '<div class="empty-state" style="margin-top:20px; color:#fca5a5;">Failed to load users. Please refresh.</div>';
+}
+
+function updateUserBadge(username) {
+  const el = document.querySelector(`.user-item[data-username="${username}"]`);
+  if (!el) {
+    renderUserList();
+    return;
+  }
+  const badge = el.querySelector('.user-item-unread-badge');
+  const count = unreadCounts.get(username) || 0;
+  if (badge) {
+    badge.textContent = count;
+    badge.classList.toggle('hidden', count <= 0);
+  }
+}
+
+function updateUserItemPreview(username) {
+  const el = document.querySelector(`.user-item[data-username="${username}"]`);
+  if (!el) return;
+  const previewEl = el.querySelector('.user-item-preview');
+  const snippet = threadSnippets.get(username);
+  if (previewEl && snippet && snippet.text) {
+    previewEl.textContent = snippet.from === me.username ? `You: ${snippet.text}` : snippet.text;
   }
 }
 
 async function selectUser(username) {
   activeUser = username;
+
+  // Clear unread for this user
+  unreadCounts.delete(username);
+  updateUserBadge(username);
+
   document.querySelectorAll('.user-item').forEach(el => {
     el.classList.toggle('active', el.dataset.username === username);
   });
@@ -397,7 +524,6 @@ async function selectUser(username) {
 
   renderedMessageIds.clear();
   renderedFileIds.clear();
-  if (chatPollInterval) clearInterval(chatPollInterval);
 
   try {
     const [msgsRes, filesRes] = await Promise.all([
@@ -428,44 +554,6 @@ async function selectUser(username) {
     console.error('Error loading thread:', err);
     chatBodyEl.innerHTML = `<div class="empty-state">Start a conversation with ${escapeHtml(username)}! 👋</div>`;
   }
-
-  // Background polling for active conversation (vital for Vercel / serverless deployments)
-  chatPollInterval = setInterval(async () => {
-    if (!activeUser || activeUser !== username) return;
-    try {
-      const [pMsgsRes, pFilesRes] = await Promise.all([
-        fetch(`/api/messages/${encodeURIComponent(username)}`),
-        fetch('/api/files')
-      ]);
-      if (!pMsgsRes.ok) return;
-      const pMsgsData = await pMsgsRes.json();
-      const pFilesData = await pFilesRes.json();
-
-      let hasNew = false;
-      if (pMsgsData.messages && pMsgsData.messages.length) {
-        pMsgsData.messages.forEach(m => {
-          if (!renderedMessageIds.has(m.id)) {
-            const emptyEl = chatBodyEl.querySelector('.empty-state');
-            if (emptyEl) chatBodyEl.innerHTML = '';
-            renderMessage(m);
-            hasNew = true;
-          }
-        });
-      }
-      if (pFilesData.files && pFilesData.files.length) {
-        const relevantFiles = pFilesData.files.filter(f => f.from === username || f.to === username);
-        relevantFiles.forEach(f => {
-          if (!renderedFileIds.has(f.id)) {
-            const emptyEl = chatBodyEl.querySelector('.empty-state');
-            if (emptyEl) chatBodyEl.innerHTML = '';
-            renderFile(f);
-            hasNew = true;
-          }
-        });
-      }
-      if (hasNew) scrollToBottom();
-    } catch (e) {}
-  }, 2500);
 }
 
 function renderMessage(msg) {
@@ -587,12 +675,23 @@ async function sendMessage() {
   emojiPicker.classList.add('hidden');
   emojiToggleBtn.classList.remove('active');
 
-  // Emit via socket if connected
+  // Optimistic local echo for instant feedback
+  const tempMsg = {
+    id: 'local_' + Date.now(),
+    from: me.username,
+    to: targetUser,
+    text,
+    avatarUrl: me.avatarUrl,
+    timestamp: Date.now()
+  };
+  renderMessage(tempMsg);
+  scrollToBottom();
+
   if (socket && socket.connected) {
     socket.emit('private-message', { to: targetUser, text });
   }
 
-  // Also send via HTTP (ensures delivery on serverless like Vercel)
+  // Send via HTTP (guarantees delivery on serverless)
   try {
     const res = await fetch('/api/messages', {
       method: 'POST',
@@ -601,16 +700,22 @@ async function sendMessage() {
     });
     const data = await res.json();
     if (res.ok && data.message) {
-      if (activeUser === targetUser && !renderedMessageIds.has(data.message.id)) {
-        renderMessage(data.message);
-        scrollToBottom();
-      }
+      renderedMessageIds.add(data.message.id);
+      threadSnippets.set(targetUser, {
+        text,
+        timestamp: data.message.timestamp,
+        from: me.username
+      });
+      updateUserItemPreview(targetUser);
     } else if (data && data.error) {
       alert(data.error);
     }
   } catch (e) {
     console.error('Failed to send message via HTTP:', e);
   }
+
+  // Trigger sync tick
+  syncNow();
 }
 
 attachBtn.addEventListener('click', () => {
@@ -629,14 +734,15 @@ fileInput.addEventListener('change', async () => {
   try {
     const res = await fetch('/api/upload', { method: 'POST', body: formData });
     const data = await res.json();
-    if (!res.ok) {
-      alert(data.error || 'Upload failed');
-    } else {
+    if (res.ok && data.file) {
       renderFile(data.file);
       scrollToBottom();
+      syncNow();
+    } else {
+      alert(data.error || 'Upload failed');
     }
-  } catch (err) {
-    alert('Upload failed. Please try again.');
+  } catch (e) {
+    alert('Upload failed due to network error');
   } finally {
     attachBtn.textContent = '📎';
     fileInput.value = '';
@@ -657,6 +763,87 @@ function setupAdminTabs() {
     loadAdminData();
   });
   refreshAdminBtn.addEventListener('click', loadAdminData);
+
+  // Admin Create User Modal wiring
+  const createUserModal = document.getElementById('createUserModal');
+  const openCreateUserModalBtn = document.getElementById('openCreateUserModalBtn');
+  const closeCreateUserModalBtn = document.getElementById('closeCreateUserModalBtn');
+  const cancelCreateUserBtn = document.getElementById('cancelCreateUserBtn');
+  const submitCreateUserBtn = document.getElementById('submitCreateUserBtn');
+  const adminCreateUserForm = document.getElementById('adminCreateUserForm');
+  const adminNewUsername = document.getElementById('adminNewUsername');
+  const adminNewPassword = document.getElementById('adminNewPassword');
+  const adminNewIsAdmin = document.getElementById('adminNewIsAdmin');
+  const adminCreateUserMsg = document.getElementById('adminCreateUserMsg');
+
+  function showAdminCreateMsg(text, type) {
+    if (!adminCreateUserMsg) return;
+    adminCreateUserMsg.className = `msg ${type}`;
+    adminCreateUserMsg.textContent = text;
+    adminCreateUserMsg.classList.remove('hidden');
+  }
+
+  function closeCreateModal() {
+    if (createUserModal) createUserModal.classList.add('hidden');
+  }
+
+  if (openCreateUserModalBtn) {
+    openCreateUserModalBtn.addEventListener('click', () => {
+      adminCreateUserMsg.classList.add('hidden');
+      adminNewUsername.value = '';
+      adminNewPassword.value = '';
+      adminNewIsAdmin.checked = false;
+      createUserModal.classList.remove('hidden');
+      adminNewUsername.focus();
+    });
+  }
+
+  if (closeCreateUserModalBtn) closeCreateUserModalBtn.addEventListener('click', closeCreateModal);
+  if (cancelCreateUserBtn) cancelCreateUserBtn.addEventListener('click', closeCreateModal);
+
+  async function handleAdminCreateUser(e) {
+    if (e) e.preventDefault();
+    const username = adminNewUsername.value.trim().toLowerCase().replace(/\s+/g, '_');
+    const password = adminNewPassword.value;
+    const isAdmin = adminNewIsAdmin.checked;
+
+    if (!username) return showAdminCreateMsg('Please enter a username', 'error');
+    if (password.length < 6) return showAdminCreateMsg('Password must be at least 6 characters', 'error');
+
+    submitCreateUserBtn.disabled = true;
+    submitCreateUserBtn.textContent = 'Creating…';
+
+    try {
+      const res = await fetch('/api/admin/users/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, isAdmin })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        submitCreateUserBtn.disabled = false;
+        submitCreateUserBtn.textContent = 'Create User ✨';
+        return showAdminCreateMsg(data.error || 'Failed to create user', 'error');
+      }
+
+      showAdminCreateMsg(`User "${username}" created!`, 'success');
+      submitCreateUserBtn.disabled = false;
+      submitCreateUserBtn.textContent = 'Create User ✨';
+
+      setTimeout(() => {
+        closeCreateModal();
+        loadAdminData();
+        syncNow(true);
+      }, 700);
+    } catch (err) {
+      submitCreateUserBtn.disabled = false;
+      submitCreateUserBtn.textContent = 'Create User ✨';
+      showAdminCreateMsg('Network error. Failed to create user.', 'error');
+    }
+  }
+
+  if (submitCreateUserBtn) submitCreateUserBtn.addEventListener('click', handleAdminCreateUser);
+  if (adminCreateUserForm) adminCreateUserForm.addEventListener('submit', handleAdminCreateUser);
 }
 
 function switchView(viewName) {
@@ -763,7 +950,7 @@ window.adminBlockUser = async function(username) {
     if (!res.ok) alert(data.error || 'Failed to block user');
     else {
       await loadAdminData();
-      await loadUsers();
+      await syncNow(true);
     }
   } catch (e) {
     alert('Action failed');
@@ -777,7 +964,7 @@ window.adminUnblockUser = async function(username) {
     if (!res.ok) alert(data.error || 'Failed to unblock user');
     else {
       await loadAdminData();
-      await loadUsers();
+      await syncNow(true);
     }
   } catch (e) {
     alert('Action failed');
@@ -794,7 +981,7 @@ window.adminDeleteUser = async function(username) {
     if (!res.ok) alert(data.error || 'Failed to delete user');
     else {
       await loadAdminData();
-      await loadUsers();
+      await syncNow(true);
     }
   } catch (e) {
     alert('Action failed');
