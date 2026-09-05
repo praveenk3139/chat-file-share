@@ -4,6 +4,14 @@
     "createdAt": 1788529442182,
     "isAdmin": true,
     "isBlocked": false,
+    "avatarFile": "peakpx (9).jpg",
+    "avatarUpdatedAt": 1788529759803
+  },
+  "pavithra": {
+    "passwordHash": "$2a$10$qjS0HXYAgGRimbnl0qNxo.H5gS2PA0AUYOMTX1/32QIVurQWe4TCS",
+    "createdAt": 1788529442182,
+    "isAdmin": false,
+    "isBlocked": false,
     "avatarFile": "avatar_praveen_1788529759786.jpg",
     "avatarUpdatedAt": 1788529759803
   },

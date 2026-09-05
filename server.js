@@ -478,7 +478,11 @@ app.get('/api/avatar/:username', async (req, res) => {
   const user = await db.getUser(username);
 
   if (user && user.avatarFile) {
-    const filePath = path.join(AVATAR_DIR, user.avatarFile);
+    let filePath = path.join(AVATAR_DIR, user.avatarFile);
+    if (!fs.existsSync(filePath)) {
+      const rootFallback = path.join(__dirname, user.avatarFile);
+      if (fs.existsSync(rootFallback)) filePath = rootFallback;
+    }
     if (fs.existsSync(filePath)) {
       res.setHeader('Cache-Control', 'public, max-age=86400');
       return res.sendFile(filePath);
